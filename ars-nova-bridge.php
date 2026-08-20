@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Ars Nova Bridge
- * Description: Exposes theme_mods (Kadence / Customizer settings), read-only options, read-only theme source files, and read-only plugin source files over the REST API so the Ars Nova WordPress connector can read and write theme settings by command. Admin-only.
- * Version: 1.2.0
+ * Description: Exposes theme_mods (Kadence / Customizer settings), read-only options, read-only theme source files, and read-only plugin source files over the REST API so the Ars Nova WordPress connector can read and write theme settings by command. Admin-only. Credentials are masked on read.
+ * Version: 1.3.0
  * Author: Ars Nova (Jonathan)
  * Requires at least: 5.6
  */
@@ -12,7 +12,135 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /** Keep in step with the `Version:` header above and the release tag. */
-define( 'ANS_BRIDGE_VERSION', '1.2.0' );
+define( 'ANS_BRIDGE_VERSION', '1.3.0' );
+
+/**
+ * ---------------------------------------------------------------------------
+ * CREDENTIAL MASKING (added 1.3.0)
+ * ---------------------------------------------------------------------------
+ *
+ * WHY THIS EXISTS
+ *
+ * The /option route below was written as a diagnostics helper and returned
+ * get_option() verbatim. On 2026-08-18 a plain read of the WooCommerce
+ * payment-gateway settings returned this site's LIVE STRIPE SECRET KEY in
+ * cleartext to a caller that had asked for nothing of the sort. The caller
+ * wanted one unrelated field; it got a payment credential.
+ *
+ * That incident was written up, and the ticketing bridge's Mailchimp endpoint
+ * was built to not repeat it - its docblock cites this very failure. But the
+ * route that actually leaked was never fixed. It was still returning raw
+ * option values on 2026-08-20, when this was found again during a defect
+ * review. Two years of good intentions in a comment do not mask a key.
+ *
+ * WHAT IT DOES
+ *
+ * Values are walked recursively and any leaf whose KEY looks like a
+ * credential is masked. Separately, any string whose VALUE has the shape of a
+ * known credential (Stripe sk_/rk_, Google AIza, GitHub ghp_, Slack xox*) is
+ * masked even when its key looks innocent - defence in depth for secrets
+ * stored under a bland name.
+ *
+ * Masking is never silent. The response carries a `masked` array listing the
+ * dot-paths that were withheld, so a caller can tell the difference between
+ * "this field is empty" and "this field was hidden from you".
+ *
+ * There is deliberately no override parameter. An endpoint with a
+ * ?show_secrets=1 escape hatch is an endpoint that leaks secrets. If a human
+ * genuinely needs a raw credential, they read it in wp-admin.
+ */
+
+/**
+ * Key names that identify a credential. Matched case-insensitively against
+ * each array key, and against the option name itself for scalar values.
+ *
+ * @return string Regex.
+ */
+function ans_bridge_secret_key_pattern() {
+	return '/(secret|password|passwd|_pwd\b|api[_\-]?key|apikey|access[_\-]?token|refresh[_\-]?token|auth[_\-]?token|bearer|private[_\-]?key|client[_\-]?secret|credential|webhook|signing|_salt\b|^salt$|licen[cs]e[_\-]?key|_key$|^key$)/i';
+}
+
+/**
+ * Value shapes that are credentials regardless of what they are called.
+ *
+ * @return string Regex.
+ */
+function ans_bridge_secret_value_pattern() {
+	return '/^(sk_live_|sk_test_|rk_live_|rk_test_|whsec_|pk_live_|AIza[0-9A-Za-z\-_]{10,}|ghp_|gho_|ghs_|github_pat_|xox[abprs]-|ya29\.|-----BEGIN [A-Z ]*PRIVATE KEY)/';
+}
+
+/**
+ * Mask a credential for display: enough to recognise, not enough to use.
+ *
+ * @param mixed $value Raw value.
+ * @return string
+ */
+function ans_bridge_mask( $value ) {
+	if ( is_array( $value ) || is_object( $value ) ) {
+		return '[masked]';
+	}
+	$value = (string) $value;
+	$len   = strlen( $value );
+	if ( 0 === $len ) {
+		return '';
+	}
+	if ( $len <= 8 ) {
+		return str_repeat( '*', $len );
+	}
+	return str_repeat( '*', $len - 4 ) . substr( $value, -4 );
+}
+
+/**
+ * Should this key/value pair be masked?
+ *
+ * @param string $key   Array key (or option name at the top level).
+ * @param mixed  $value Value at that key.
+ * @return bool
+ */
+function ans_bridge_is_secret( $key, $value ) {
+	if ( '' !== (string) $key && preg_match( ans_bridge_secret_key_pattern(), (string) $key ) ) {
+		return true;
+	}
+	if ( is_string( $value ) && '' !== $value && preg_match( ans_bridge_secret_value_pattern(), $value ) ) {
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Walk a value, masking anything that looks like a credential.
+ *
+ * @param mixed  $value  Value to sanitise.
+ * @param string $path   Dot-path of $value, for the report.
+ * @param array  $masked Collected dot-paths, by reference.
+ * @param int    $depth  Recursion guard.
+ * @return mixed Sanitised copy.
+ */
+function ans_bridge_scrub( $value, $path, &$masked, $depth = 0 ) {
+	if ( $depth > 12 ) {
+		return '[too deep]';
+	}
+
+	if ( is_object( $value ) ) {
+		$value = get_object_vars( $value );
+	}
+
+	if ( is_array( $value ) ) {
+		$out = array();
+		foreach ( $value as $k => $v ) {
+			$child = ( '' === $path ) ? (string) $k : $path . '.' . $k;
+			if ( ans_bridge_is_secret( $k, $v ) ) {
+				$out[ $k ]  = ans_bridge_mask( $v );
+				$masked[]   = $child;
+				continue;
+			}
+			$out[ $k ] = ans_bridge_scrub( $v, $child, $masked, $depth + 1 );
+		}
+		return $out;
+	}
+
+	return $value;
+}
 
 add_action( 'rest_api_init', function () {
 
@@ -34,11 +162,14 @@ add_action( 'rest_api_init', function () {
 			if ( ! is_array( $mods ) ) {
 				$mods = array();
 			}
+			$masked = array();
+			$mods   = ans_bridge_scrub( $mods, '', $masked );
 			return new WP_REST_Response( array(
 				'theme'      => $theme->get_stylesheet(),
 				'theme_name' => $theme->get( 'Name' ),
 				'count'      => count( $mods ),
 				'mods'       => $mods,
+				'masked'     => $masked,
 			), 200 );
 		},
 	) );
@@ -80,11 +211,15 @@ add_action( 'rest_api_init', function () {
 				$removed[] = $key;
 			}
 
+			$masked = array();
+			$mods   = ans_bridge_scrub( get_theme_mods(), '', $masked );
+
 			return new WP_REST_Response( array(
 				'ok'      => true,
 				'changed' => $changed,
 				'removed' => $removed,
-				'mods'    => get_theme_mods(),
+				'mods'    => $mods,
+				'masked'  => $masked,
 			), 200 );
 		},
 	) );
@@ -92,6 +227,9 @@ add_action( 'rest_api_init', function () {
 	/**
 	 * GET /wp-json/ars-nova/v1/option?name=<option_name>
 	 * Read-only fetch of a single wp_options row (diagnostics).
+	 *
+	 * Credentials are masked - see the docblock at the top of this file, and
+	 * the 2026-08-18 Stripe secret-key incident that is the reason for it.
 	 */
 	register_rest_route( 'ars-nova/v1', '/option', array(
 		'methods'             => 'GET',
@@ -101,9 +239,25 @@ add_action( 'rest_api_init', function () {
 			if ( '' === $name ) {
 				return new WP_Error( 'missing_name', 'Pass ?name=option_name', array( 'status' => 400 ) );
 			}
+
+			$value  = get_option( $name, null );
+			$masked = array();
+
+			// A scalar option whose NAME is credential-shaped is masked whole.
+			if ( ! is_array( $value ) && ! is_object( $value ) && ans_bridge_is_secret( $name, $value ) ) {
+				$value    = ans_bridge_mask( $value );
+				$masked[] = $name;
+			} else {
+				$value = ans_bridge_scrub( $value, '', $masked );
+			}
+
 			return new WP_REST_Response( array(
-				'name'  => $name,
-				'value' => get_option( $name, null ),
+				'name'   => $name,
+				'value'  => $value,
+				'masked' => $masked,
+				'note'   => empty( $masked )
+					? 'No credential-shaped fields found.'
+					: 'Credential-shaped fields were masked. Read them in wp-admin if genuinely required; this endpoint has no override by design.',
 			), 200 );
 		},
 	) );
@@ -196,6 +350,12 @@ add_action( 'rest_api_init', function () {
 	 *
 	 * Gated on activate_plugins rather than edit_theme_options - plugin source
 	 * is a higher bar than theme settings.
+	 *
+	 * NOTE (1.3.0): this route returns source verbatim and is NOT scrubbed.
+	 * Source files are code, not credentials, and masking them would defeat
+	 * the "what is actually running?" purpose. Secrets belong in wp-config or
+	 * an encrypted option, never in plugin source - if a credential ever shows
+	 * up here, the leak is that it was committed, not that this route read it.
 	 */
 	register_rest_route( 'ars-nova/v1', '/plugin-file', array(
 		'methods'             => 'GET',

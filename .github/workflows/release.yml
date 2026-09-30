@@ -1,0 +1,38 @@
+# Copy to .github/workflows/release.yml in a plugin repo and set PLUGIN_FOLDER.
+#
+#   git tag vX.Y.Z && git push origin vX.Y.Z   -> builds, releases, installs on STAGING
+#   Actions -> release -> Run workflow (tag, target=live)   -> promotes the same zip to LIVE
+#
+# Repo secrets required: KINSTA_SSH_KEY, KINSTA_KNOWN_HOSTS.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to deploy, e.g. v1.43.0
+        required: true
+      target:
+        description: Where to install it
+        required: true
+        default: live
+        type: choice
+        options: [live, staging]
+
+# The pipeline attaches the zip to the GitHub Release, so it needs write access
+# to contents. Repos default to a read-only token; without this the run fails
+# at startup.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ArsNovaSingers/ans-release-workflows/.github/workflows/wp-plugin-release.yml@v1
+    with:
+      plugin_folder: ars-nova-bridge
+      target: ${{ github.event_name == 'push' && 'staging' || inputs.target }}
+      tag: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    secrets: inherit
